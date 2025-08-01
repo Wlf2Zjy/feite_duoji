@@ -27,6 +27,7 @@
 
 #include "stm32f1xx_hal.h"
 #include <string.h>
+#include <stdio.h>
 extern UART_HandleTypeDef huart2;
 
 /* USER CODE END Includes */
@@ -40,6 +41,7 @@ extern UART_HandleTypeDef huart2;
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define RX_BUFFER_SIZE 64
 
 /* USER CODE END PD */
 
@@ -51,7 +53,9 @@ extern UART_HandleTypeDef huart2;
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+uint8_t rs485_rxBuffer[RX_BUFFER_SIZE];
+uint16_t rs485_rxIndex = 0;
+uint8_t commandReceived = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,9 +72,6 @@ void RS485_ReceiveEnable(void)
 {
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
 }
-void RS485_Init(void) {
-    RS485_ReceiveEnable(); // 上电默认为接收模式
-}
 
 // 发送数据函数
 void RS485_SendData(uint8_t *pData, uint16_t Size)
@@ -82,13 +83,17 @@ void RS485_SendData(uint8_t *pData, uint16_t Size)
 }
 
 // 接收数据函数
-HAL_StatusTypeDef RS485_ReceiveData(uint8_t *pData, uint16_t Size)
-{
-	// 强制切换到接收模式（防止之前处于发送状态）
+// 非阻塞接收函数
+HAL_StatusTypeDef RS485_ReceiveData(uint8_t *pData, uint16_t Size) {
+    // 确保在接收模式
     RS485_ReceiveEnable();
     
-    // 执行阻塞式接收
-    return HAL_UART_Receive(&huart1, pData, Size, 1000);
+    // 检查是否有数据
+    if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE)) {
+        HAL_UART_Receive(&huart1, pData, Size, 0);
+        return HAL_OK;
+    }
+    return HAL_TIMEOUT;
 }
 /* USER CODE END PFP */
 
@@ -148,6 +153,30 @@ void feetech_servo_rotate(uint8_t id, float angle, uint16_t speed) {
     uart2_send_buf(packet, 13);
 }
 
+// 指令解析函数
+void parse_command(uint8_t *cmd) {
+    int servo_id;
+    float angle;
+    
+    // 尝试解析指令格式 "#ID,角度"
+    if (sscanf((char*)cmd, "#%d,%f", &servo_id, &angle) == 2) {
+        // 验证参数范围
+        if (servo_id >= 1 && servo_id <= 254 && angle >= 0.0f && angle <= 360.0f) {
+            char msg[50];
+            sprintf(msg, "Moving servo %d to %.1f degrees\r\n", servo_id, angle);
+            uart2_send_buf((uint8_t*)msg, strlen(msg));
+            
+            // 控制舵机转动
+            feetech_servo_rotate(servo_id, angle, 5000);
+        } else {
+            uart2_send_buf((uint8_t*)"Invalid parameters\r\n", 20);
+        }
+    } else {
+        uart2_send_buf((uint8_t*)"Invalid command format\r\n", 23);
+    }
+}
+
+
 /* USER CODE END 0 */
 
 /**
@@ -182,10 +211,12 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM2_Init();
   MX_USART2_UART_Init();
+	
   /* USER CODE BEGIN 2 */
-  uint8_t sendData[] = "Hello, RS485!";//试验
-  uint8_t receiveData[20];
-
+  //uint8_t sendData[] = "Hello, RS485!";//试验
+  //uint8_t receiveData[20];
+  RS485_ReceiveEnable(); // 确保485处于接收模式
+  uart2_send_buf((uint8_t*)"RS485 Servo Controller Ready\r\n", 30);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -210,7 +241,7 @@ int main(void)
         feetech_servo_rotate(1, 0.0f, 5000);
         HAL_Delay(2000);*/
 		// 发送数据
-        RS485_SendData(sendData, sizeof(sendData));
+        /*RS485_SendData(sendData, sizeof(sendData));
 
         // 接收数据
         if (RS485_ReceiveData(receiveData, sizeof(receiveData)) == HAL_OK)
@@ -218,7 +249,34 @@ int main(void)
             // 处理接收到的数据
         }
 
-        HAL_Delay(1000);
+        HAL_Delay(1000);*/
+				uint8_t byte;
+        
+        // 尝试接收一个字节
+        if (RS485_ReceiveData(&byte, 1) == HAL_OK) {
+            // 缓冲区未满时存储数据
+            if (rs485_rxIndex < RX_BUFFER_SIZE - 1) {
+                rs485_rxBuffer[rs485_rxIndex++] = byte;
+                
+                // 检测到换行符表示指令结束
+                if (byte == '\n') {
+                    rs485_rxBuffer[rs485_rxIndex] = '\0'; // 添加字符串结束符
+                    commandReceived = 1;
+                }
+            } else {
+                // 缓冲区溢出，重置
+                rs485_rxIndex = 0;
+            }
+        }
+        
+        // 处理接收到的完整指令
+        if (commandReceived) {
+            parse_command(rs485_rxBuffer);
+            rs485_rxIndex = 0;
+            commandReceived = 0;
+        }
+        
+        HAL_Delay(1); // 短暂延时，减少CPU占用
   }
   /* USER CODE END 3 */
 }
