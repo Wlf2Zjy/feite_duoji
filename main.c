@@ -37,20 +37,27 @@ extern UART_HandleTypeDef huart2;
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-typedef struct {
-    uint8_t header;     // 指令头 (0xA5)
-    uint8_t servo_id;   // 舵机ID
-    uint16_t position;  // 位置值 (0-4095)
-} ServoCommand;
+// 接收状态枚举
+typedef enum {
+    RX_STATE_WAIT_HEADER1,      // 等待帧头第一个字节
+    RX_STATE_WAIT_HEADER2,      // 等待帧头第二个字节
+    RX_STATE_WAIT_LENGTH,       // 等待长度字节
+    RX_STATE_WAIT_CMD,          // 等待指令字节
+    RX_STATE_WAIT_CONTENT,      // 等待内容字节
+    RX_STATE_WAIT_END           // 等待结束字节
+} RxState;
+
+
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-
-#define RX_BUFFER_SIZE 4        // 4字节指令长度
-#define COMMAND_HEADER 0xA5     // 指令头标识
+#define RX_BUFFER_SIZE 64       // 接收缓冲区大小
+#define FRAME_HEADER_1 0xFE     // 帧头第一个字节
+#define FRAME_HEADER_2 0xFE     // 帧头第二个字节
+#define FRAME_END 0xFA          // 帧结束字节
 #define MAX_SERVO_ID 254        // 最大舵机ID
 
 /* USER CODE END PD */
@@ -64,11 +71,15 @@ typedef struct {
 
 /* USER CODE BEGIN PV */
 // 添加接收缓冲区
-uint8_t uart_rxByte; // 串口接收的单个字节
-uint8_t uart_rxBuffer[RX_BUFFER_SIZE];   // 接收缓冲区
-uint8_t uart_rxIndex = 0;                // 接收索引
-volatile uint8_t commandReceived = 0;     // 命令接收完成标志
-ServoCommand currentCommand;              // 当前解析的命令
+uint8_t uart_rxByte;            // 串口接收的单个字节
+volatile RxState rxState = RX_STATE_WAIT_HEADER1; // 接收状态
+
+// 协议帧变量
+uint8_t rx_cmd;                 // 接收到的指令
+uint8_t rx_len;                 // 接收到的长度
+uint8_t rx_content[64];         // 接收到的内容
+uint8_t rx_content_index;       // 内容索引
+volatile uint8_t frameReceived = 0; // 帧接收完成标志
 
 /* USER CODE END PV */
 
@@ -140,6 +151,34 @@ uint8_t calc_checksum(uint8_t *buf, uint8_t len) {
     }
     return ~(sum & 0xFF);
 }
+
+// 发送响应帧
+void send_response_frame(uint8_t cmd, uint8_t return_len, uint8_t *return_content) {
+    uint8_t frame[64];
+    uint8_t index = 0;
+    
+    // 帧头
+    frame[index++] = FRAME_HEADER_1;
+    frame[index++] = FRAME_HEADER_2;
+    
+    // 返回长度 (Return Command + Return Content)
+    frame[index++] = return_len + 1; // +1 for Return Command
+    
+    // 返回指令
+    frame[index++] = cmd;
+    
+    // 返回内容
+    if (return_content != NULL && return_len > 0) {
+        memcpy(&frame[index], return_content, return_len);
+        index += return_len;
+    }
+    
+    // 结束位
+    frame[index++] = FRAME_END;
+    
+    // 发送响应
+    RS485_SendData(frame, index);
+}
 /**
   * @brief  The application entry point.
   * @retval int
@@ -187,40 +226,84 @@ void feetech_servo_rotate(uint8_t id, float angle, uint16_t speed) {
     RS485_ReceiveEnable(); // 切换回接收模式
 }
 
-// 指令解析函数
-void parse_command(uint8_t *data) {
-    currentCommand.header = data[0];
-    currentCommand.servo_id = data[1];
-    currentCommand.position = (data[3] << 8) | data[2]; // 小端序解析
+// 处理接收到的协议帧
+void process_protocol_frame(void) {
+    uint8_t response_content[64] = {0};
+    uint8_t response_len = 0;
     
-    // 验证指令头
-    if(currentCommand.header != COMMAND_HEADER) {
-        return;
-    }
-    
-    // 验证舵机ID范围
-    if(currentCommand.servo_id == 0 || currentCommand.servo_id > MAX_SERVO_ID) {
-        return;
-    }
-    
-    // 验证位置范围 (0-4095)
-    if(currentCommand.position > 4095) {
-        return;
-    }
-    
-    // 执行舵机控制
-    feetech_servo_rotate(currentCommand.servo_id, currentCommand.position, 500);
-}
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if(huart->Instance == USART1) {
-        // 将接收到的字节存入缓冲区
-        uart_rxBuffer[uart_rxIndex++] = uart_rxByte;
+    // 自定义舵机控制指令 (0x20)
+    if (rx_cmd == 0x20 && rx_len >= 3) {
+        // 指令格式: [舵机ID, 位置低8位, 位置高8位]
+        uint8_t servo_id = rx_content[0];
+        uint16_t position = (rx_content[2] << 8) | rx_content[1];
         
-        // 检查是否收到完整指令
-        if(uart_rxIndex >= RX_BUFFER_SIZE) {
-            commandReceived = 1; // 设置命令接收标志
-            uart_rxIndex = 0;    // 重置索引
+        // 验证舵机ID范围
+        if(servo_id > 0 && servo_id <= MAX_SERVO_ID) {
+            // 执行舵机控制
+            feetech_servo_rotate(servo_id, (position / 4095.0f) * 360.0f, 500);
+        }
+        
+        // 发送响应
+        response_content[0] = 1; // 成功
+        send_response_frame(0x20, response_len, response_content);
+    }
+    
+}
+// 串口接收完成回调
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART1) {
+        switch (rxState) {
+            case RX_STATE_WAIT_HEADER1:
+                if (uart_rxByte == FRAME_HEADER_1) {
+                    rxState = RX_STATE_WAIT_HEADER2;
+                }
+                break;
+                
+            case RX_STATE_WAIT_HEADER2:
+                if (uart_rxByte == FRAME_HEADER_2) {
+                    rxState = RX_STATE_WAIT_LENGTH;
+                } else {
+                    rxState = RX_STATE_WAIT_HEADER1;
+                }
+                break;
+                
+            case RX_STATE_WAIT_LENGTH:
+                rx_len = uart_rxByte;
+                rx_content_index = 0;
+                
+                if (rx_len > 0) {
+                    rxState = RX_STATE_WAIT_CMD;
+                } else {
+                    rxState = RX_STATE_WAIT_END;
+                }
+                break;
+                
+            case RX_STATE_WAIT_CMD:
+                rx_cmd = uart_rxByte;
+                if (rx_len > 1) {
+                    rxState = RX_STATE_WAIT_CONTENT;
+                } else {
+                    rxState = RX_STATE_WAIT_END;
+                }
+                break;
+                
+            case RX_STATE_WAIT_CONTENT:
+                if (rx_content_index < sizeof(rx_content)) {
+                    rx_content[rx_content_index++] = uart_rxByte;
+                }
+                
+                if (rx_content_index >= (rx_len - 1)) {
+                    rxState = RX_STATE_WAIT_END;
+                }
+                break;
+                
+            case RX_STATE_WAIT_END:
+                if (uart_rxByte == FRAME_END) {
+                    // 完整帧接收完成
+                    frameReceived = 1;
+                }
+                rxState = RX_STATE_WAIT_HEADER1;
+                break;
         }
         
         // 重新启动接收
@@ -274,7 +357,7 @@ int main(void)
   HAL_UART_Receive_IT(&huart1, &uart_rxByte, 1);
   
   // 初始测试：转动舵机到中间位置
-  feetech_servo_rotate(1, 2048, 500);
+  feetech_servo_rotate(1, 180.0f, 500);
   HAL_Delay(1000);
   /* USER CODE END 2 */
 
@@ -283,16 +366,13 @@ int main(void)
 
   while (1)
   {
-		    // 检查命令接收标志
-    if(commandReceived) {
-        // 解析并执行命令
-        parse_command(uart_rxBuffer);
+		   // 检查帧接收标志
+    if(frameReceived) {
+        // 处理协议帧
+        process_protocol_frame();
         
         // 重置标志
-        commandReceived = 0;
-			
-			// 清除缓冲区
-        memset((void*)uart_rxBuffer, 0, RX_BUFFER_SIZE);
+        frameReceived = 0;
 		}
 		HAL_Delay(1);
 		
