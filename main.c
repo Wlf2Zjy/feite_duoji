@@ -47,7 +47,15 @@ typedef enum {
     RX_STATE_WAIT_END           // 等待结束字节
 } RxState;
 
-
+// 舵机反馈解析状态
+typedef enum {
+    SERVO_RX_WAIT_HEADER1,
+    SERVO_RX_WAIT_HEADER2,
+    SERVO_RX_WAIT_ID,
+    SERVO_RX_WAIT_LENGTH,
+    SERVO_RX_WAIT_ERROR,
+    SERVO_RX_WAIT_PARAMS
+} ServoRxState;
 
 /* USER CODE END PTD */
 
@@ -59,6 +67,13 @@ typedef enum {
 #define FRAME_HEADER_2 0xFE     // 帧头第二个字节
 #define FRAME_END 0xFA          // 帧结束字节
 #define FIXED_SERVO_ID 1        // 固定舵机ID
+
+// 舵机指令定义
+#define SERVO_HEADER1 0xFF
+#define SERVO_HEADER2 0xFF
+#define SERVO_READ_DATA 0x02
+#define SERVO_POSITION_ADDR 0x2A
+#define SERVO_POSITION_LEN 0x02
 
 /* USER CODE END PD */
 
@@ -80,6 +95,10 @@ uint8_t rx_len;                 // 接收到的长度
 uint8_t rx_content[64];         // 接收到的内容
 uint8_t rx_content_index;       // 内容索引
 volatile uint8_t frameReceived = 0; // 帧接收完成标志
+
+// 舵机位置读取相关变量
+volatile uint16_t servo_position = 0; // 舵机当前位置
+volatile uint8_t servo_position_updated = 0; // 位置更新标志
 
 /* USER CODE END PV */
 
@@ -190,6 +209,11 @@ uint16_t angle_to_position(float angle) {
     return (uint16_t)((angle / 360.0f) * 4095);
 }
 
+// 位置转角度
+float position_to_angle(uint16_t position) {
+    return (position / 4095.0f) * 360.0f;
+}
+
 void feetech_servo_rotate(float angle, uint16_t speed) {
     uint16_t pos = angle_to_position(angle);//转指令码
     uint8_t buf[12];
@@ -226,35 +250,97 @@ void feetech_servo_rotate(float angle, uint16_t speed) {
     RS485_ReceiveEnable(); // 切换回接收模式
 }
 
+// 读取舵机位置
+uint16_t read_servo_position(void) {
+    uint8_t read_cmd[8] = {
+        SERVO_HEADER1,
+        SERVO_HEADER2,
+        FIXED_SERVO_ID,
+        0x04,           // 长度
+        SERVO_READ_DATA,// 读取指令
+        SERVO_POSITION_ADDR, // 位置寄存器地址
+        SERVO_POSITION_LEN,  // 读取长度
+        0x00            // 校验位(临时)
+    };
+    
+    // 计算校验和
+    uint8_t checksum = 0;
+    for(int i = 2; i < 7; i++) { // ID到最后一个参数
+        checksum += read_cmd[i];
+    }
+    read_cmd[7] = ~checksum;
+    
+    // 清空接收缓冲区
+    __HAL_UART_FLUSH_DRREGISTER(&huart2);
+    
+    // 发送读取指令
+    RS485_SendEnable(); // 切换到发送模式
+    HAL_UART_Transmit(&huart2, read_cmd, 8, 100);
+    HAL_Delay(1); // 确保数据发送完成
+    RS485_ReceiveEnable(); // 切换回接收模式
+    
+    // 等待舵机响应
+    uint8_t response[10];
+    HAL_StatusTypeDef status = HAL_UART_Receive(&huart2, response, 10, 50); // 50ms超时
+    
+    if(status == HAL_OK) {
+        // 检查响应帧
+        if(response[0] == SERVO_HEADER1 && 
+           response[1] == SERVO_HEADER2 &&
+           response[2] == FIXED_SERVO_ID) {
+            
+            // 提取位置值 (低字节在前)
+            uint16_t pos = (response[6] << 8) | response[5];
+            return pos;
+        }
+    }
+    
+    return 0xFFFF; // 读取失败
+}
+
 // 处理接收到的协议帧
 void process_protocol_frame(void) {
-    uint8_t response_content[1] = {0x01}; // 固定返回0x01
-    uint8_t response_len = 1;
+    uint8_t response_content[2] = {0}; // 位置响应内容
+    uint8_t response_len = 0;
     
-    // 自定义舵机控制指令 (0x01)
+    // 舵机控制指令 (0x01)
     if (rx_cmd == 0x01 && rx_content_index >= 2) {
-			
         // 指令格式: [位置高8位, 位置低8位]
-        //uint8_t servo_id = rx_content[0];
-        // 验证舵机ID范围
-        //if(servo_id > 0 && servo_id <= MAX_SERVO_ID) {
-			
-            // 执行舵机控制
-           if (rx_cmd == 0x01 && rx_content_index >= 2) {
-        uint16_t position = (rx_content[0] << 8) | rx_content[1]; // 指令格式: [位置高8位, 位置低8位]
+        uint16_t position = (rx_content[0] << 8) | rx_content[1];
         
-        feetech_servo_rotate((position / 4095.0f) * 360.0f, 500);   // 执行舵机控制
-    }
-        //}
+        // 执行舵机控制
+        feetech_servo_rotate((position / 4095.0f) * 360.0f, 500);
         
         // 发送响应
-        //response_content[0] = 1; // 成功
+        response_content[0] = 0x01; // 成功
+        response_len = 1;
         send_response_frame(0x01, response_len, response_content);
-		    // 重置接收状态
-        rx_content_index = 0;
+    }
+    // 读取位置指令 (0x02)
+    else if (rx_cmd == 0x02) {
+        // 读取舵机当前位置
+        uint16_t current_pos = read_servo_position();
+        
+        if(current_pos != 0xFFFF) {
+            // 准备响应内容 [位置高8位, 位置低8位]
+            response_content[0] = (current_pos >> 8) & 0xFF; // 高字节
+            response_content[1] = current_pos & 0xFF;        // 低字节
+            response_len = 2;
+        } else {
+            // 读取失败
+            response_content[0] = 0x00; // 错误代码
+            response_content[1] = 0x00; 
+            response_len = 2;
+        }
+        
+        // 发送响应
+        send_response_frame(0x02, response_len, response_content);
     }
     
+    // 重置接收状态
+    rx_content_index = 0;
 }
+
 // 串口接收完成回调
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART1) {
