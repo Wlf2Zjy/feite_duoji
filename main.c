@@ -75,8 +75,11 @@ typedef enum {
 #define SERVO_HEADER1 0xFF
 #define SERVO_HEADER2 0xFF
 #define SERVO_READ_DATA 0x02
+#define SERVO_WRITE_DATA 0x03 //重置指令
 #define SERVO_POSITION_ADDR 0x38
-#define SERVO_POSITION_LEN 0x02
+#define SERVO_POSITION_LEN 0x02  // 定义零位数据长度
+#define SERVO_RESET_ADDR 0x28 //重置指令
+#define SERVO_RESET_VALUE 0x80 //重置指令
 
 /* USER CODE END PD */
 
@@ -90,9 +93,9 @@ typedef enum {
 /* USER CODE BEGIN PV */
 // 添加接收缓冲区
 uint8_t uart_rxByte;            // 串口接收的单个字节
-uint8_t uart2_rxByte;           // 串口接收的单个字节
+uint8_t uart2_rxByte;           // 串口接收的单个字节2
 volatile RxState rxState = RX_STATE_WAIT_HEADER1; // 接收状态
-volatile RxState rxState2 = RX_STATE_WAIT_HEADER1; // 接收状态
+volatile RxState rxState2 = RX_STATE_WAIT_HEADER1; // 接收状态2
 
 // 协议帧变量
 uint8_t rx_cmd;                 // 接收到的指令
@@ -101,11 +104,11 @@ uint8_t rx_content[64];         // 接收到的内容
 uint8_t rx_content_index;       // 内容索引
 volatile uint8_t frameReceived = 0; // 帧接收完成标志
 
-uint8_t rx2_cmd;                // 接收到的指令
-uint8_t rx2_len;                // 接收到的长度
-uint8_t rx2_content[64];        // 接收到的内容
-uint8_t rx2_content_index;      // 内容索引
-volatile uint8_t frameReceived2 = 0; // 帧接收完成标志
+uint8_t rx2_cmd;                // 接收到的指令2
+uint8_t rx2_len;                // 接收到的长度2
+uint8_t rx2_content[64];        // 接收到的内容2
+uint8_t rx2_content_index;      // 内容索引2
+volatile uint8_t frameReceived2 = 0; // 帧接收完成标志2
 
 // 舵机位置读取相关变量
 volatile uint16_t servo_position = 0; // 舵机当前位置
@@ -261,6 +264,32 @@ void feetech_servo_rotate(float angle, uint16_t speed) {
     HAL_Delay(1); // 确保数据发送完成
 }
 
+// 舵机重置零位
+void servo_reset_zero(void) {
+    uint8_t reset_cmd[8] = {
+        SERVO_HEADER1,
+        SERVO_HEADER2,
+        FIXED_SERVO_ID,
+        0x04,           // 长度
+        SERVO_WRITE_DATA,// 写指令(0x03)
+        SERVO_RESET_ADDR, // 重置寄存器地址
+        SERVO_RESET_VALUE, // 重置值
+        0x00            // 校验位(临时)
+    };
+    
+    // 计算校验和
+    uint8_t checksum = 0;
+    for(int i = 2; i < 7; i++) { // ID到最后一个参数
+        checksum += reset_cmd[i];
+    }
+    reset_cmd[7] = ~checksum;
+    
+    // 发送重置指令
+    HAL_UART_Transmit(&huart2, reset_cmd, sizeof(reset_cmd), 100);
+    HAL_Delay(50); // 确保舵机有足够时间处理
+}
+
+
 // 读取舵机位置 (阻塞式等待)
 uint16_t read_servo_position(void) {
     uint8_t read_cmd[8] = {
@@ -317,6 +346,7 @@ void process_protocol_frame(void) {
         response_len = 1;
         send_response_frame(0x01, response_len, response_content);
     }
+		
     // 读取位置指令 (0x02)
     else if (rx_cmd == 0x02) {
         // 读取舵机当前位置
@@ -336,6 +366,17 @@ void process_protocol_frame(void) {
         
         // 发送响应
         send_response_frame(0x02, response_len, response_content);
+    }
+		
+    // 重置舵机零位指令 (0x03)
+    else if (rx_cmd == 0x03) {
+        // 执行舵机重置
+        servo_reset_zero();
+        
+        // 发送响应
+        response_content[0] = 0x01; // 成功
+        response_len = 1;
+        send_response_frame(0x03, response_len, response_content);
     }
     
     // 重置接收状态
@@ -620,7 +661,7 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
-	__disable_irq();
+  __disable_irq();
   while (1)
   {
 
