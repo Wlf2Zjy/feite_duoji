@@ -42,13 +42,11 @@ extern UART_HandleTypeDef huart1;
 typedef enum {
     RX_STATE_WAIT_HEADER1,      // 等待帧头第一个字节
     RX_STATE_WAIT_HEADER2,      // 等待帧头第二个字节
-		RX_STATE_WAIT_ID,
     RX_STATE_WAIT_LENGTH,       // 等待长度字节
     RX_STATE_WAIT_CMD,          // 等待指令字节
     RX_STATE_WAIT_CONTENT,      // 等待内容字节
     RX_STATE_WAIT_END           // 等待结束字节
 } RxState;
-
 
 // 舵机反馈解析状态
 typedef enum {
@@ -57,7 +55,9 @@ typedef enum {
     SERVO_RX_WAIT_ID,
     SERVO_RX_WAIT_LENGTH,
     SERVO_RX_WAIT_ERROR,
-    SERVO_RX_WAIT_PARAMS
+    SERVO_RX_WAIT_PARAM_LOW,
+    SERVO_RX_WAIT_PARAM_HIGH,
+    SERVO_RX_WAIT_CHECKSUM
 } ServoRxState;
 
 /* USER CODE END PTD */
@@ -90,7 +90,7 @@ typedef enum {
 /* USER CODE BEGIN PV */
 // 添加接收缓冲区
 uint8_t uart_rxByte;            // 串口接收的单个字节
-uint8_t uart2_rxByte;            // 串口接收的单个字节
+uint8_t uart2_rxByte;           // 串口接收的单个字节
 volatile RxState rxState = RX_STATE_WAIT_HEADER1; // 接收状态
 volatile RxState rxState2 = RX_STATE_WAIT_HEADER1; // 接收状态
 
@@ -101,15 +101,22 @@ uint8_t rx_content[64];         // 接收到的内容
 uint8_t rx_content_index;       // 内容索引
 volatile uint8_t frameReceived = 0; // 帧接收完成标志
 
-uint8_t rx2_cmd;                 // 接收到的指令
-uint8_t rx2_len;                 // 接收到的长度
-uint8_t rx2_content[64];         // 接收到的内容
-uint8_t rx2_content_index;       // 内容索引
+uint8_t rx2_cmd;                // 接收到的指令
+uint8_t rx2_len;                // 接收到的长度
+uint8_t rx2_content[64];        // 接收到的内容
+uint8_t rx2_content_index;      // 内容索引
 volatile uint8_t frameReceived2 = 0; // 帧接收完成标志
 
 // 舵机位置读取相关变量
 volatile uint16_t servo_position = 0; // 舵机当前位置
 volatile uint8_t servo_position_updated = 0; // 位置更新标志
+
+// 舵机反馈解析相关变量
+volatile ServoRxState servo_rx_state = SERVO_RX_WAIT_HEADER1;
+uint8_t servo_rx_id;
+uint8_t servo_rx_length;
+uint8_t servo_rx_error;
+volatile uint8_t servo_rx_complete = 0;
 
 /* USER CODE END PV */
 
@@ -120,14 +127,12 @@ void SystemClock_Config(void);
 void RS485_SendEnable(void) //发送使能函数
 {
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
-//		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
 }
 
 // 接收使能函数
 void RS485_ReceiveEnable(void)
 {
-//    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
-		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
 }
 
 // 发送数据函数
@@ -163,15 +168,15 @@ void uart2_send_buf(uint8_t *buf, uint16_t len) {
 // 添加调试信息发送函数
 void debug_printf(char *format, ...) {
     char buffer[128];
-		RS485_SendEnable();
     va_list args;
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     
     // 使用USART1发送调试信息
+    RS485_SendEnable();
     HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), 1000);
-		RS485_ReceiveEnable();
+    RS485_ReceiveEnable();
 }
 
 uint8_t calc_checksum(uint8_t *buf, uint8_t len) {
@@ -209,10 +214,7 @@ void send_response_frame(uint8_t cmd, uint8_t return_len, uint8_t *return_conten
     // 发送响应
     RS485_SendData(frame, index);
 }
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
+
 // 角度限制在0~360度之间
 uint16_t angle_to_position(float angle) {
     if(angle < 0) angle = 0;
@@ -259,14 +261,14 @@ void feetech_servo_rotate(float angle, uint16_t speed) {
     HAL_Delay(1); // 确保数据发送完成
 }
 
-// 读取舵机位置
+// 读取舵机位置 (阻塞式等待)
 uint16_t read_servo_position(void) {
     uint8_t read_cmd[8] = {
         SERVO_HEADER1,
         SERVO_HEADER2,
         FIXED_SERVO_ID,
         0x04,           // 长度
-        SERVO_READ_DATA,// 读取指令(0x2A)
+        SERVO_READ_DATA,// 读取指令(0x02)
         SERVO_POSITION_ADDR, // 位置寄存器地址
         SERVO_POSITION_LEN,  // 读取长度
         0x00            // 校验位(临时)
@@ -279,62 +281,20 @@ uint16_t read_servo_position(void) {
     }
     read_cmd[7] = ~checksum;
     
-//    // 清空接收缓冲区
-//    __HAL_UART_FLUSH_DRREGISTER(&huart2);
+    // 重置舵机接收状态
+    servo_rx_state = SERVO_RX_WAIT_HEADER1;
+    servo_rx_complete = 0;
     
     // 发送读取指令
     HAL_UART_Transmit(&huart2, read_cmd, sizeof(read_cmd), 100);
-//    HAL_Delay(1000);
     
-    // 等待舵机响应 (正确响应帧为8字节)
-//    uint8_t response[8];
-//		HAL_StatusTypeDef status = HAL_UART_Receive(&huart2, response, sizeof(response), 1000); // 增加超时时间
-		
-		
-//		uint8_t getData;
-//		for(uint8_t i = 0; i<8; i++){
-//			HAL_UART_Receive(&huart2, &getData, 1, 1000); // 增加超时时间
-//			HAL_UART_Transmit(&huart1, &getData, 1, 1000);
-//			HAL_Delay(100);
-//		}
-//		
-//    HAL_StatusTypeDef status = HAL_OK;
-//    if(status == HAL_OK) {
-//        // 调试输出接收到的原始数据
-//         //debug_printf("RX: ");
-//        // for(int i=0; i<sizeof(response); i++) {
-//        //     debug_printf("%02X ", response[i]);
-//        // }
-//        // debug_printf("\r\n");
-//        
-//        // 检查响应帧头
-//        if(response[0] == SERVO_HEADER1 && 
-//           response[1] == SERVO_HEADER2 &&
-//           response[2] == FIXED_SERVO_ID) {
-//            
-//            // 验证校验和 (ID到参数结束)
-//            uint8_t rx_checksum = 0;
-//            for(int i=2; i<7; i++) {
-//                rx_checksum += response[i];
-//            }
-//            rx_checksum = ~rx_checksum;
-//            
-//            if(rx_checksum == response[7]) {
-//                
-//                uint16_t pos = (response[6] << 8) | response[5];
-//                return pos;
-//            }
-//            // else {
-//            //     debug_printf("Checksum error\r\n");
-//            // }
-//        }
-        // else {
-        //     debug_printf("Header error\r\n");
-        // }
-//    }
-//     else {
-//         debug_printf("Timeout\r\n");
-//     }
+    // 等待舵机响应 (最多20ms)
+    uint32_t start_tick = HAL_GetTick();
+    while((HAL_GetTick() - start_tick) < 20) {
+        if(servo_rx_complete) {
+            return servo_position;
+        }
+    }
     
     return 0xFFFF; // 读取失败
 }
@@ -385,15 +345,14 @@ void process_protocol_frame(void) {
 
 // 处理接收到的协议帧
 void process_protocol_frame2(void) {
-   
-    // 舵机控制指令 (0x01)
+    // 舵机控制指令 (0x00)
     if (rx2_cmd == 0x00 && rx2_content_index >= 2) {
         // 指令格式: [位置高8位, 位置低8位]
-      uint16_t position = (rx2_content[0] << 8) | rx2_content[1];
-			RS485_SendEnable();
-			HAL_UART_Transmit(&huart1, &rx2_content[0], 1, 100);
-			HAL_UART_Transmit(&huart1, &rx2_content[1], 1, 100);
-			RS485_ReceiveEnable();
+        uint16_t position = (rx2_content[0] << 8) | rx2_content[1];
+        RS485_SendEnable();
+        HAL_UART_Transmit(&huart1, &rx2_content[0], 1, 100);
+        HAL_UART_Transmit(&huart1, &rx2_content[1], 1, 100);
+        RS485_ReceiveEnable();
     }
     
     // 重置接收状态
@@ -418,12 +377,12 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
                     rxState = RX_STATE_WAIT_HEADER1;
                 }
                 break;
-								
-						case RX_STATE_WAIT_LENGTH:
-              rx_len = uart_rxByte;
-              rx_content_index = 0;
                 
-								if (rx_len >= 2) { // 至少包含指令和结束符
+            case RX_STATE_WAIT_LENGTH:
+                rx_len = uart_rxByte;
+                rx_content_index = 0;
+                
+                if (rx_len >= 2) { // 至少包含指令和结束符
                     rxState = RX_STATE_WAIT_CMD;
                 } else {
                     rxState = RX_STATE_WAIT_HEADER1; // 无效长度
@@ -434,10 +393,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
                 rx_cmd = uart_rxByte;
                 if (rx_len > 2) { // 接收 (长度-指令-结束符)
                     rxState = RX_STATE_WAIT_CONTENT;
-										
                 } else {
                     rxState = RX_STATE_WAIT_END;
-										frameReceived = 1;
+                    frameReceived = 1;
                 }
                 break;
                 
@@ -464,63 +422,73 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
         // 重新启动接收
         HAL_UART_Receive_IT(&huart1, &uart_rxByte, 1);
     }
-		if (huart->Instance == USART2) {
-			switch (rxState2) {
-            case RX_STATE_WAIT_HEADER1:
-                if (uart2_rxByte == 0xFF) {
-                    rxState2 = RX_STATE_WAIT_HEADER2;
+    else if (huart->Instance == USART2) {
+        // 舵机协议解析
+        switch (servo_rx_state) {
+            case SERVO_RX_WAIT_HEADER1:
+                if (uart2_rxByte == SERVO_HEADER1) {
+                    servo_rx_state = SERVO_RX_WAIT_HEADER2;
                 }
                 break;
                 
-            case RX_STATE_WAIT_HEADER2:
-                if (uart2_rxByte == 0xFF) {
-                    rxState2 = RX_STATE_WAIT_ID;
+            case SERVO_RX_WAIT_HEADER2:
+                if (uart2_rxByte == SERVO_HEADER2) {
+                    servo_rx_state = SERVO_RX_WAIT_ID;
                 } else {
-                    rxState2 = RX_STATE_WAIT_HEADER1;
+                    servo_rx_state = SERVO_RX_WAIT_HEADER1;
                 }
                 break;
-						case RX_STATE_WAIT_ID:
-                 rxState2 = RX_STATE_WAIT_LENGTH;
-                break;
-						case RX_STATE_WAIT_LENGTH:
-              rx2_len = uart2_rxByte;
-              rx2_content_index = 0;
                 
-								if (rx2_len >= 2) { // 至少包含指令和结束符
-                    rxState2 = RX_STATE_WAIT_CMD;
+            case SERVO_RX_WAIT_ID:
+                servo_rx_id = uart2_rxByte;
+                if (servo_rx_id == FIXED_SERVO_ID) {
+                    servo_rx_state = SERVO_RX_WAIT_LENGTH;
                 } else {
-                    rxState2 = RX_STATE_WAIT_HEADER1; // 无效长度
+                    servo_rx_state = SERVO_RX_WAIT_HEADER1; // 非目标ID，丢弃
                 }
                 break;
                 
-            case RX_STATE_WAIT_CMD:
-                 rx2_cmd = uart2_rxByte;
-                 rxState2 = RX_STATE_WAIT_CONTENT;
-                break;
-                
-            case RX_STATE_WAIT_CONTENT:
-                if (rx2_content_index < sizeof(rx2_content)) {
-                    rx2_content[rx2_content_index++] = uart2_rxByte;
-                }
-                
-                // 检查是否接收完所有内容 (长度 = 指令1字节 + 内容n字节 + 结束符1字节)
-                if (rx2_content_index >= (rx2_len - 2)) {
-                    rxState2 = RX_STATE_WAIT_END;
+            case SERVO_RX_WAIT_LENGTH:
+                servo_rx_length = uart2_rxByte;
+                // 位置反馈帧长度应为4 (错误码+位置低+位置高+校验和)
+                if (servo_rx_length == 0x04) {
+                    servo_rx_state = SERVO_RX_WAIT_ERROR;
+                } else {
+                    servo_rx_state = SERVO_RX_WAIT_HEADER1; // 长度不符，丢弃
                 }
                 break;
                 
-            case RX_STATE_WAIT_END:
-//                if (uart2_rxByte == FRAME_END) {
-//                    // 完整帧接收完成
-//                    frameReceived2 = 1;
-//                }
-								frameReceived2 = 1;
-                rxState2 = RX_STATE_WAIT_HEADER1;
+            case SERVO_RX_WAIT_ERROR:
+                servo_rx_error = uart2_rxByte;
+                servo_rx_state = SERVO_RX_WAIT_PARAM_LOW;
+                break;
+                
+            case SERVO_RX_WAIT_PARAM_LOW:
+                // 位置低字节 (舵机返回的是低字节在前)
+                servo_position = uart2_rxByte;
+                servo_rx_state = SERVO_RX_WAIT_PARAM_HIGH;
+                break;
+                
+            case SERVO_RX_WAIT_PARAM_HIGH:
+                // 位置高字节 (舵机返回的是高字节在后)
+                servo_position |= (uart2_rxByte << 8);
+                servo_rx_state = SERVO_RX_WAIT_CHECKSUM;
+                break;
+                
+            case SERVO_RX_WAIT_CHECKSUM:
+                // 校验和验证 (简单跳过)
+                servo_rx_complete = 1; // 标记完成
+                servo_rx_state = SERVO_RX_WAIT_HEADER1;
+                break;
+                
+            default:
+                servo_rx_state = SERVO_RX_WAIT_HEADER1;
                 break;
         }
-			
-				HAL_UART_Receive_IT(&huart2, &uart2_rxByte, 1);
-		}
+        
+        // 重新启动USART2接收
+        HAL_UART_Receive_IT(&huart2, &uart2_rxByte, 1);
+    }
 }
 
 
@@ -558,17 +526,14 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM2_Init();
   MX_USART2_UART_Init();
-	
+  
   /* USER CODE BEGIN 2 */
   RS485_ReceiveEnable();
 
-// 发送启动消息
-
-
- // 启动串口接收中断
+  // 启动串口接收中断
   HAL_UART_Receive_IT(&huart1, &uart_rxByte, 1);
   HAL_UART_Receive_IT(&huart2, &uart2_rxByte, 1);
-	
+  
   // 初始测试：转动舵机到中间位置
   feetech_servo_rotate(180.0f, 500);
   HAL_Delay(1000);
@@ -579,24 +544,22 @@ int main(void)
 
   while (1)
   {
-		   // 检查帧接收标志
-    if(frameReceived) {
-        // 处理协议帧
-        process_protocol_frame();
-        
-        // 重置标志
-        frameReceived = 0;
-		}
-		if(frameReceived2) {
-        // 处理协议帧
-        process_protocol_frame2();
-        
-        // 重置标志
-        frameReceived2 = 0;
-		}
-		HAL_Delay(1);
-		
-
+      // 检查帧接收标志
+      if(frameReceived) {
+          // 处理协议帧
+          process_protocol_frame();
+          
+          // 重置标志
+          frameReceived = 0;
+      }
+      if(frameReceived2) {
+          // 处理协议帧
+          process_protocol_frame2();
+          
+          // 重置标志
+          frameReceived2 = 0;
+      }
+      HAL_Delay(1);
 
     /* USER CODE END WHILE */
 
@@ -657,13 +620,14 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
+	__disable_irq();
   while (1)
   {
 
   }
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
