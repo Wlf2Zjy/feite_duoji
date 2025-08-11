@@ -61,7 +61,7 @@ typedef enum {
     SERVO_RX_WAIT_CHECKSUM
 } ServoRxState;
 
-uint8_t rx_id;
+
 
 /* USER CODE END PTD */
 
@@ -88,6 +88,13 @@ uint8_t rx_id;
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+typedef   uint32_t   u32;///32
+typedef   uint16_t   u16;///16
+typedef   uint8_t     u8;///8
+#define RGB_LED_COUNT 5  // RGB灯珠数量
+#define RGB_CTRL_PIN GPIO_PIN_1  // PB1控制RGB灯
+#define RGB_GPIO_PORT GPIOB
+u8 led_colors[RGB_LED_COUNT][3];
 
 /* USER CODE END PM */
 
@@ -101,6 +108,7 @@ volatile RxState rxState = RX_STATE_WAIT_HEADER1; // 接收状态
 volatile RxState rxState2 = RX_STATE_WAIT_HEADER1; // 接收状态2
 
 // 协议帧变量
+uint8_t rx_id;
 uint8_t rx_cmd;                 // 接收到的指令
 uint8_t rx_len;                 // 接收到的长度
 uint8_t rx_content[64];         // 接收到的内容
@@ -205,7 +213,7 @@ void send_response_frame(uint8_t cmd, uint8_t return_len, uint8_t *return_conten
     // 返回长度 (ID1字节 + 指令1字节 + 内容n字节 + 结束符1字节)
     frame[index++] = return_len + 3; //长度计算
     
-    // 舵机ID (使用接收到的ID)  <--- 关键修改
+    // 舵机ID (使用接收到的ID)  
     frame[index++] = rx_id;
     
     // 返回指令
@@ -235,6 +243,50 @@ uint16_t angle_to_position(float angle) {
 float position_to_angle(uint16_t position) {
     return (position / 4095.0f) * 360.0f;
 }
+
+//灯珠的nop
+void delay_ns(u32 nus)//n=1 330-360ns
+	{
+	for(int i=0;i<nus;i++)
+		__nop();
+}
+//电平
+void RGB_WriteByte(u8 in_data){
+	uint8_t n = 0;
+	uint8_t y = 0,z = 0;
+		n = in_data;
+		for(y = 0;y < 8;y++){
+			z = ((n<<y)&0x80);
+			if(z){
+				HAL_GPIO_WritePin(GPIOB,GPIO_PIN_1,GPIO_PIN_SET);
+				delay_ns(2);
+				HAL_GPIO_WritePin(GPIOB,GPIO_PIN_1,GPIO_PIN_RESET);
+				__nop();// 1码
+
+			}else{    
+				HAL_GPIO_WritePin(GPIOB,GPIO_PIN_1,GPIO_PIN_SET);
+				__nop();    //
+				HAL_GPIO_WritePin(GPIOB,GPIO_PIN_1,GPIO_PIN_RESET);
+				delay_ns(2);// 0码 
+			}
+		}
+}
+
+// 设置一个灯的颜色
+void RGB_ColorSet(u8 red,u8 green,u8 blue)
+{
+	// 灯的实际写入颜色是GRB
+	RGB_WriteByte(green);  // 写入绿色
+	RGB_WriteByte(red); // 写入红色
+	RGB_WriteByte(blue); // 写入蓝色
+}
+
+void Set_LEDs_Color(u8 colors[RGB_LED_COUNT][3]) {
+    for (int i = 0; i < RGB_LED_COUNT; i++) {
+        RGB_ColorSet(colors[i][1], colors[i][0], colors[i][2]); // GRB顺序
+    }
+}
+
 
 void feetech_servo_rotate(uint8_t servo_id, float angle, uint16_t speed) {
     uint16_t pos = angle_to_position(angle);
@@ -379,6 +431,21 @@ void process_protocol_frame(void) {
         response_len = 1;
         send_response_frame(0x03, response_len, response_content);
     }
+		
+		else if (rx_cmd == 0x04 && rx_content_index >= 15) { // 5灯珠*3字节=15
+        // 解析颜色数据 [G0, R0, B0, G1, R1, B1, ...]
+        for (int i = 0; i < RGB_LED_COUNT; i++) {
+            led_colors[i][0] = rx_content[i*3];     // G
+            led_colors[i][1] = rx_content[i*3+1];   // R
+            led_colors[i][2] = rx_content[i*3+2];   // B
+        }
+				// 设置LED颜色
+        Set_LEDs_Color(led_colors);
+        response_content[0] = 0x01; // 成功
+        response_len = 1;
+        send_response_frame(0x04, response_len, response_content);
+    }
+				
     
     // 重置接收状态
     rx_content_index = 0;
@@ -450,7 +517,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
             case RX_STATE_WAIT_CONTENT:
                 if (rx_content_index < sizeof(rx_content)) {
                     rx_content[rx_content_index++] = uart_rxByte;
-                }
+                }else{
+										rxState = RX_STATE_WAIT_HEADER1;
+								}
                 
                 // 检查是否接收完所有内容 (长度 = ID1字节 + 指令1字节 + 内容n字节 + 结束符1字节)
                 if (rx_content_index >= (rx_len - 3)) {
@@ -584,6 +653,7 @@ int main(void)
   // 初始测试：转动舵机到中间位置
   //feetech_servo_rotate(180.0f, 500);
   //HAL_Delay(1000);
+	
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -607,6 +677,20 @@ int main(void)
           frameReceived2 = 0;
       }
       HAL_Delay(1);
+//				HAL_GPIO_WritePin(GPIOB,GPIO_PIN_1,GPIO_PIN_RESET);
+//		delay_ns(500);// 大于280us的低电平过来，然后才会将刚刚发送过来的24bit数据应用到灯上 
+//		
+//    RGB_ColorSet(0x00, 0x00, 0xff); // 蓝色
+//    RGB_ColorSet(0xff, 0x00, 0xff); // 品红色
+//    RGB_ColorSet(0x00, 0xff, 0x00); // 绿色
+//    RGB_ColorSet(0xff, 0xff, 0x00); // 黄色
+//    RGB_ColorSet(0x66, 0xff, 0xff); // 天蓝色
+//			
+//		HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,GPIO_PIN_SET);//关闭
+//		HAL_GPIO_WritePin(GPIOC,GPIO_PIN_2,GPIO_PIN_RESET); //点亮
+//		HAL_Delay(500);//作为送数据结束标志
+//		HAL_GPIO_WritePin(GPIOC,GPIO_PIN_2,GPIO_PIN_SET);  //熄灭
+//		HAL_Delay(500); 
 
     /* USER CODE END WHILE */
 
