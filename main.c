@@ -43,6 +43,7 @@ typedef enum {
     RX_STATE_WAIT_HEADER1,      // 等待帧头第一个字节
     RX_STATE_WAIT_HEADER2,      // 等待帧头第二个字节
     RX_STATE_WAIT_LENGTH,       // 等待长度字节
+	  RX_STATE_WAIT_ID,           // 新增：等待舵机ID字节
     RX_STATE_WAIT_CMD,          // 等待指令字节
     RX_STATE_WAIT_CONTENT,      // 等待内容字节
     RX_STATE_WAIT_END           // 等待结束字节
@@ -59,6 +60,8 @@ typedef enum {
     SERVO_RX_WAIT_PARAM_HIGH,
     SERVO_RX_WAIT_CHECKSUM
 } ServoRxState;
+
+uint8_t rx_id;
 
 /* USER CODE END PTD */
 
@@ -199,8 +202,11 @@ void send_response_frame(uint8_t cmd, uint8_t return_len, uint8_t *return_conten
     frame[index++] = FRAME_HEADER_1;
     frame[index++] = FRAME_HEADER_2;
     
-    // 返回长度 (指令1字节 + 内容n字节 + 结束符1字节)
-    frame[index++] = return_len + 2; //长度计算
+    // 返回长度 (ID1字节 + 指令1字节 + 内容n字节 + 结束符1字节)
+    frame[index++] = return_len + 3; //长度计算
+    
+    // 舵机ID (使用接收到的ID)  <--- 关键修改
+    frame[index++] = rx_id;
     
     // 返回指令
     frame[index++] = cmd;
@@ -230,22 +236,19 @@ float position_to_angle(uint16_t position) {
     return (position / 4095.0f) * 360.0f;
 }
 
-void feetech_servo_rotate(float angle, uint16_t speed) {
-    uint16_t pos = angle_to_position(angle);//转指令码
+void feetech_servo_rotate(uint8_t servo_id, float angle, uint16_t speed) {
+    uint16_t pos = angle_to_position(angle);
     uint8_t buf[12];
     buf[0] = 0xFF;
     buf[1] = 0xFF;
-    buf[2] = FIXED_SERVO_ID; // 使用固定ID
+    buf[2] = servo_id;  // 使用接收到的ID  
     buf[3] = 0x09;
     buf[4] = 0x03;
     buf[5] = 0x2A;
-
-    buf[6] = (pos & 0xff); //低
-    buf[7] = (pos >> 8); //高
-
+    buf[6] = (pos & 0xff);
+    buf[7] = (pos >> 8);
     buf[8] = 0x00;
     buf[9] = 0x00;
-
     buf[10] = speed & 0xFF;
     buf[11] = (speed >> 8);
 
@@ -259,9 +262,7 @@ void feetech_servo_rotate(float angle, uint16_t speed) {
     memcpy(packet, buf, 12);
     packet[12] = checksum;
 
-    // 使用USART2发送到舵机
-    HAL_UART_Transmit(&huart2, packet, 13, 1000); // huart2
-    HAL_Delay(1); // 确保数据发送完成
+    HAL_UART_Transmit(&huart2, packet, 13, 1000);
 }
 
 // 舵机重置零位
@@ -338,8 +339,8 @@ void process_protocol_frame(void) {
         // 指令格式: [位置高8位, 位置低8位]
         uint16_t position = (rx_content[0] << 8) | rx_content[1];
         
-        // 执行舵机控制
-        feetech_servo_rotate((position / 4095.0f) * 360.0f, 5000);
+        // 使用接收到的ID控制舵机
+        feetech_servo_rotate(rx_id, (position / 4095.0f) * 360.0f, 5000);
         
         // 发送响应
         response_content[0] = 0x01; // 成功
@@ -423,16 +424,22 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
                 rx_len = uart_rxByte;
                 rx_content_index = 0;
                 
-                if (rx_len >= 2) { // 至少包含指令和结束符
-                    rxState = RX_STATE_WAIT_CMD;
+                if (rx_len >= 3) { // 至少包含ID、指令和结束符
+                    rxState = RX_STATE_WAIT_ID;  // 新增状态
                 } else {
                     rxState = RX_STATE_WAIT_HEADER1; // 无效长度
                 }
                 break;
                 
+            // 新增：等待ID状态
+            case RX_STATE_WAIT_ID:
+                rx_id = uart_rxByte;  // 存储接收到的ID
+                rxState = RX_STATE_WAIT_CMD;
+                break;
+                
             case RX_STATE_WAIT_CMD:
                 rx_cmd = uart_rxByte;
-                if (rx_len > 2) { // 接收 (长度-指令-结束符)
+                if (rx_len > 3) { // 接收 (长度-ID-指令-结束符)
                     rxState = RX_STATE_WAIT_CONTENT;
                 } else {
                     rxState = RX_STATE_WAIT_END;
@@ -445,8 +452,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
                     rx_content[rx_content_index++] = uart_rxByte;
                 }
                 
-                // 检查是否接收完所有内容 (长度 = 指令1字节 + 内容n字节 + 结束符1字节)
-                if (rx_content_index >= (rx_len - 2)) {
+                // 检查是否接收完所有内容 (长度 = ID1字节 + 指令1字节 + 内容n字节 + 结束符1字节)
+                if (rx_content_index >= (rx_len - 3)) {
                     rxState = RX_STATE_WAIT_END;
                 }
                 break;
@@ -567,7 +574,6 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM2_Init();
   MX_USART2_UART_Init();
-  
   /* USER CODE BEGIN 2 */
   RS485_ReceiveEnable();
 
@@ -576,8 +582,8 @@ int main(void)
   HAL_UART_Receive_IT(&huart2, &uart2_rxByte, 1);
   
   // 初始测试：转动舵机到中间位置
-  feetech_servo_rotate(180.0f, 500);
-  HAL_Delay(1000);
+  //feetech_servo_rotate(180.0f, 500);
+  //HAL_Delay(1000);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -668,7 +674,6 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
